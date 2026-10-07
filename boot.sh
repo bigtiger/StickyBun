@@ -5,9 +5,10 @@
 #
 # Env (set by pod.sh): TS_AUTHKEY TS_HOSTNAME MODEL_REPO MODEL_PATH MODEL_DIR
 #                      CTX IDLE_MIN EXTRA_ARGS HF_TOKEN(optional)
-set -euo pipefail
+set -Eeuo pipefail
 
 PORT=8080
+exec > >(tee -a /tmp/boot.log) 2>&1   # console + file, so a failing pod can serve its own log
 LLAMA_LOG=/tmp/llama.log   # prompts never go to the provider-visible console
 
 # The key RunPod injects into pods may be too restricted to delete the pod (it was: HTTP 403),
@@ -19,9 +20,16 @@ kill_pod() {
   while true; do echo "[boot] !!! CANNOT SELF-TERMINATE; pod is still billing, run './pod.sh down'"; sleep 600; done
 }
 
-# Any failure: go offline on the tailnet (pod.sh sees that and terminates us), say why on the
-# console, leave 5 min to read it, then try to stop the billing ourselves.
-trap 'rc=$?; echo "[boot] FAILED (line $LINENO, rc=$rc); terminating pod in 5m"; tailscale down 2>/dev/null || true; sleep 300; kill_pod' ERR
+# Any failure: stay on the tailnet and serve the tail of the boot log on :8081 so pod.sh can print
+# it and terminate us; if nobody does, try to stop the billing ourselves after 10 min.
+serve_failure() {
+  tailscale serve --bg --tcp=8081 tcp://127.0.0.1:8081 >/dev/null 2>&1 || true
+  while true; do
+    { printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n'; tail -n 60 /tmp/boot.log; } \
+      | nc -l -s 127.0.0.1 -p 8081 -q1 >/dev/null 2>&1
+  done
+}
+trap 'rc=$?; trap - ERR; echo "[boot] FAILED (line $LINENO, rc=$rc); serving log on :8081, terminating in 10m"; serve_failure & sleep 600; kill_pod' ERR
 
 echo "[boot] started $(date -u +%FT%TZ) on $(hostname); gpu: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | paste -sd';' -)"
 mkdir -p /var/run/tailscale

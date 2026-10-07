@@ -121,10 +121,16 @@ cmd_up() {
     curl -fs --max-time 5 "http://$ip:8080/health" >/dev/null 2>&1 && break
     sleep 15; t=$((t+15)); printf '.'
     if ! pod_alive; then echo; echo "pod vanished; check RunPod console logs" >&2; rm -f "$STATE"; exit 1; fi
-    # boot.sh takes the node offline when it fails; 3 misses in a row = boot failed, stop billing.
+    # A failed boot.sh serves its log on :8081. Print it, then stop the billing.
+    local flog; flog=$(curl -fs --max-time 5 "http://$ip:8081/" 2>/dev/null || true)
+    if [ -n "$flog" ]; then
+      echo; echo "---- pod boot failed; its log: ----" >&2; echo "$flog" >&2; echo "-----------------------------------" >&2
+      cmd_down; exit 1
+    fi
+    # Fallback: node dropped off the tailnet 3 checks in a row (crash with no log).
     if on_tailnet; then gone=0; else gone=$((gone+1)); fi
     if [ $gone -ge 3 ]; then
-      echo; echo "pod dropped off the tailnet: boot failed. terminating. Read the pod's CONTAINER logs in the RunPod console (not System logs)." >&2
+      echo; echo "pod dropped off the tailnet with no log; terminating. Check the pod's CONTAINER logs in the RunPod console." >&2
       cmd_down; exit 1
     fi
     if [ $t -ge "$READY_TIMEOUT" ]; then
