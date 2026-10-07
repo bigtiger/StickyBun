@@ -10,18 +10,18 @@ set -euo pipefail
 PORT=8080
 LLAMA_LOG=/tmp/llama.log   # prompts never go to the provider-visible console
 
+# The key RunPod injects into pods may be too restricted to delete the pod (it was: HTTP 403),
+# so try every route and, if all fail, shout. pod.sh also notices and terminates from outside.
 kill_pod() {
-  if [ -n "${RUNPOD_API_KEY:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ]; then
-    curl -fsS -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" \
-      "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" || true
-  else
-    echo "[boot] no RUNPOD_API_KEY/POD_ID in env; cannot self-terminate"
-  fi
-  sleep 3600
+  if command -v runpodctl >/dev/null 2>&1 && runpodctl remove pod "${RUNPOD_POD_ID:-}" 2>&1; then return; fi
+  if [ -n "${RUNPOD_API_KEY:-}" ] && [ -n "${RUNPOD_POD_ID:-}" ] \
+     && curl -fsS -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID"; then return; fi
+  while true; do echo "[boot] !!! CANNOT SELF-TERMINATE; pod is still billing, run './pod.sh down'"; sleep 600; done
 }
 
-# Any failure: say so on the console, leave 5 min to read it, then stop the billing.
-trap 'rc=$?; echo "[boot] FAILED (line $LINENO, rc=$rc); terminating pod in 5m"; sleep 300; kill_pod' ERR
+# Any failure: go offline on the tailnet (pod.sh sees that and terminates us), say why on the
+# console, leave 5 min to read it, then try to stop the billing ourselves.
+trap 'rc=$?; echo "[boot] FAILED (line $LINENO, rc=$rc); terminating pod in 5m"; tailscale down 2>/dev/null || true; sleep 300; kill_pod' ERR
 
 echo "[boot] started $(date -u +%FT%TZ) on $(hostname); gpu: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | paste -sd';' -)"
 mkdir -p /var/run/tailscale
@@ -52,16 +52,22 @@ while read -r path size; do   # only count files not already fully cached
   if [ ! -f "$MODEL_DIR/$path" ] || [ -f "$MODEL_DIR/$path.aria2" ]; then need=$((need + size)); fi
 done < <(echo "$listing" | jq -r '.[] | "\(.path) \(.size)"')
 have=$(df -B1 --output=avail "$MODEL_DIR" | tail -n1)
-echo "[boot] still to download: $((need/1000000000))GB; free in $MODEL_DIR: $((have/1000000000))GB"
-[ "$have" -gt "$need" ] || { echo "[boot] not enough free space on volume"; false; }
+echo "[boot] still to download: $((need/1000000000))GB (df free: $((have/1000000000))GB; unreliable on network volumes)"
+[ "$have" -gt "$need" ] || { echo "[boot] not enough free space"; false; }
 
 for f in $files; do
   [ -f "$MODEL_DIR/$f" ] && [ ! -f "$MODEL_DIR/$f.aria2" ] && { echo "[boot] cached: $f"; continue; }
   mkdir -p "$MODEL_DIR/$(dirname "$f")"
   echo "[boot] downloading $f"
-  aria2c -q -x16 -s16 -k4M -c --dir="$MODEL_DIR/$(dirname "$f")" -o "$(basename "$f")" \
+  # file-allocation=none: preallocating 40GB fails (rc 17) on RunPod network volumes.
+  # If aria2 still fails, fall back to a single resumable curl stream.
+  aria2c --file-allocation=none --console-log-level=warn --summary-interval=30 --download-result=hide \
+    -x16 -s16 -k4M -c --dir="$MODEL_DIR/$(dirname "$f")" -o "$(basename "$f")" \
     ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} \
-    "https://huggingface.co/$MODEL_REPO/resolve/main/$f"
+    "https://huggingface.co/$MODEL_REPO/resolve/main/$f" \
+  || { echo "[boot] aria2c failed, falling back to curl"; rm -f "$MODEL_DIR/$f.aria2"; \
+       curl -fL -C - --retry 5 --retry-delay 5 "${auth[@]}" -o "$MODEL_DIR/$f" \
+         "https://huggingface.co/$MODEL_REPO/resolve/main/$f"; }
 done
 first="$MODEL_DIR/$(echo "$files" | head -n1)"
 echo "[boot] model ready: $first"

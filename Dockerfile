@@ -10,6 +10,10 @@ RUN apt-get update \
  && cp /tmp/tailscale_*/tailscale /tmp/tailscale_*/tailscaled /usr/local/bin/ \
  && rm -rf /tmp/tailscale_*
 
+# Best effort: runpodctl lets a pod remove itself with the key RunPod injects. Optional.
+RUN (curl -fsSL https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64 -o /usr/local/bin/runpodctl \
+     && chmod +x /usr/local/bin/runpodctl) || echo "runpodctl not installed"
+
 COPY boot.sh /boot.sh
 RUN chmod +x /boot.sh
 ENTRYPOINT ["/boot.sh"]
