@@ -31,7 +31,7 @@ kill_pod() {
 serve_failure() {
   tailscale serve --bg --tcp=8081 tcp://127.0.0.1:8081 >/dev/null 2>&1 || true
   while true; do
-    { printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n'; tail -n 60 /tmp/boot.log; } \
+    { printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n'; tail -n 90 /tmp/boot.log; } \
       | nc -l -s 127.0.0.1 -p 8081 -q1 >/dev/null 2>&1
   done
 }
@@ -130,8 +130,13 @@ echo "[boot] $ENGINE server pid $LLAMA_PID (log: $LLAMA_LOG, via 'tailscale ssh'
 # failure path instead of idling silently until the watchdog. Ready = /health answers 200.
 for _ in $(seq 1 240); do                         # up to ~40 min to load
   if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-    echo "[boot] $ENGINE server exited during startup; last lines of $LLAMA_LOG:"
-    tail -n 40 "$LLAMA_LOG"
+    # The cause sits above a long traceback: vLLM's last 40 lines were all
+    # "Engine core initialization failed" frames, the real error scrolled off.
+    echo "[boot] $ENGINE server exited during startup; error lines from $LLAMA_LOG:"
+    grep -E "Error|Exception|error:|CUDA|out of memory|not supported|Traceback" "$LLAMA_LOG" \
+      | grep -v '^ *File "' | grep -v "Engine core initialization failed" | tail -n 25 || true
+    echo "[boot] last lines:"
+    tail -n 15 "$LLAMA_LOG"
     false
   fi
   curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { echo "[boot] $ENGINE server healthy"; break; }
