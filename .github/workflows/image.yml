@@ -3,7 +3,7 @@ name: image
 on:
   push:
     branches: [main]
-    paths: [Dockerfile, boot.sh, .github/workflows/image.yml]
+    paths: [Dockerfile, Dockerfile.vllm, boot.sh, .github/workflows/image.yml]
   workflow_dispatch:
 
 permissions:
@@ -27,3 +27,15 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/stickybun:latest
+      # ENGINE=vllm image (pod.sh picks :vllm). The vLLM base image is large
+      # enough to risk filling a standard runner's ~14GB of free disk, so
+      # drop the preinstalled toolchains this build doesn't use first.
+      - name: free disk for the vLLM base image
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.vllm
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/stickybun:vllm

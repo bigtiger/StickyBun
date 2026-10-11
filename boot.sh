@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Image ENTRYPOINT (see Dockerfile). Tailscale, aria2, jq and llama-server are baked in.
-# Joins the tailnet in userspace mode, fetches the model, serves llama-server
-# on 127.0.0.1 only (reachable solely via tailscale), and self-terminates when idle.
+# Image ENTRYPOINT (see Dockerfile / Dockerfile.vllm). Joins the tailnet in
+# userspace mode, serves the model on 127.0.0.1 only (reachable solely via
+# tailscale), and self-terminates when idle.
+#
+# ENGINE=llama (default, Dockerfile): fetches and verifies GGUF files, runs llama-server.
+# ENGINE=vllm (Dockerfile.vllm): vLLM fetches MODEL_REPO itself into HF_HOME on the
+#   volume and serves it with native tool-call parsing (TOOL_PARSER) and request
+#   priority, so a live-coach call can jump ahead of long analyst generations.
 #
 # Env (set by pod.sh): TS_AUTHKEY TS_HOSTNAME MODEL_REPO MODEL_PATH MODEL_DIR
-#                      CTX IDLE_MIN EXTRA_ARGS HF_TOKEN(optional)
+#                      CTX IDLE_MIN EXTRA_ARGS HF_TOKEN(optional) ENGINE TOOL_PARSER
 set -Eeuo pipefail
 
 PORT=8080
+ENGINE=${ENGINE:-llama}
 exec > >(tee -a /tmp/boot.log) 2>&1   # console + file, so a failing pod can serve its own log
-LLAMA_LOG=/tmp/llama.log   # prompts never go to the provider-visible console
+LLAMA_LOG=/tmp/llama.log   # server log (either engine); prompts never go to the provider-visible console
 
 # The key RunPod injects into pods may be too restricted to delete the pod (it was: HTTP 403),
 # so try every route and, if all fail, shout. pod.sh also notices and terminates from outside.
@@ -41,6 +47,21 @@ unset TS_AUTHKEY
 tailscale serve --bg --tcp="$PORT" "tcp://127.0.0.1:$PORT" || echo "[boot] warn: tailscale serve failed"
 echo "[boot] tailnet up as $TS_HOSTNAME"
 
+if [ "$ENGINE" = vllm ]; then
+  # vLLM downloads and caches the repo itself; HF_HOME on the volume makes the
+  # next pod's start a cache hit. Served as "model" so clients don't care which.
+  export HF_HOME="$MODEL_DIR/hf"
+  mkdir -p "$HF_HOME"
+  echo "[boot] vllm serving $MODEL_REPO (tool parser ${TOOL_PARSER:?set TOOL_PARSER for ENGINE=vllm})"
+  # shellcheck disable=SC2086
+  nohup vllm serve "$MODEL_REPO" --host 127.0.0.1 --port "$PORT" --served-model-name model \
+    --max-model-len "$CTX" --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" \
+    --scheduling-policy priority \
+    --structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
+    ${EXTRA_ARGS:-} >"$LLAMA_LOG" 2>&1 &
+  LLAMA_PID=$!
+  METRIC_PREFIX='^vllm:'
+else
 echo "[boot] model $MODEL_REPO / $MODEL_PATH -> $MODEL_DIR"
 mkdir -p "$MODEL_DIR"
 auth=(); [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
@@ -101,24 +122,26 @@ LS=$(command -v llama-server || echo /app/llama-server)
 nohup "$LS" -m "$first" -ngl 999 -c "$CTX" --host 127.0.0.1 --port "$PORT" \
   --metrics --alias behemoth ${EXTRA_ARGS:-} >"$LLAMA_LOG" 2>&1 &
 LLAMA_PID=$!
-echo "[boot] llama-server pid $LLAMA_PID (log: $LLAMA_LOG, via 'tailscale ssh')"
+METRIC_PREFIX='^llamacpp:'
+fi
+echo "[boot] $ENGINE server pid $LLAMA_PID (log: $LLAMA_LOG, via 'tailscale ssh')"
 
 # Supervise startup: if llama-server dies (bad GGUF, CUDA OOM, flag error) surface its log through the
 # failure path instead of idling silently until the watchdog. Ready = /health answers 200.
 for _ in $(seq 1 240); do                         # up to ~40 min to load
   if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-    echo "[boot] llama-server exited during startup; last lines of $LLAMA_LOG:"
+    echo "[boot] $ENGINE server exited during startup; last lines of $LLAMA_LOG:"
     tail -n 40 "$LLAMA_LOG"
     false
   fi
-  curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { echo "[boot] llama-server healthy"; break; }
+  curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { echo "[boot] $ENGINE server healthy"; break; }
   sleep 10
 done
 
-# Activity = any change in llama.cpp's metrics. Unreachable/dead server counts as idle.
+# Activity = any change in the server's metrics. Unreachable/dead server counts as idle.
 last=""; idle_since=$(date +%s)
 while sleep 60; do
-  cur=$(curl -fs "http://127.0.0.1:$PORT/metrics" | grep '^llamacpp:' | md5sum | cut -d' ' -f1 || echo down)
+  cur=$(curl -fs "http://127.0.0.1:$PORT/metrics" | grep "$METRIC_PREFIX" | md5sum | cut -d' ' -f1 || echo down)
   [ -z "$cur" ] && cur=down
   if [ "$cur" != "$last" ]; then last="$cur"; idle_since=$(date +%s); fi
   if [ $(( $(date +%s) - idle_since )) -ge $(( IDLE_MIN * 60 )) ]; then

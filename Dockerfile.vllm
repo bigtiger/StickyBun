@@ -1,0 +1,24 @@
+# vLLM variant (ENGINE=vllm in pod.sh): same boot.sh, tailnet-only serving
+# and idle watchdog as the llama.cpp image, but serves safetensors/FP8
+# models with vLLM's native tool-call parsers and request priority.
+# Pinned: tool-call parsers have broken and been re-fixed across recent
+# releases, so bump deliberately and re-run a tool-call smoke test.
+FROM vllm/vllm-openai:v0.31.0
+LABEL org.opencontainers.image.source="https://github.com/bigtiger/StickyBun"
+LABEL org.opencontainers.image.description="vLLM OpenAI server + Tailscale, started by boot.sh (ENGINE=vllm)"
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl jq ca-certificates netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/* \
+ && f=$(curl -fsSL 'https://pkgs.tailscale.com/stable/?mode=json' | jq -r '.Tarballs.amd64') \
+ && curl -fsSL "https://pkgs.tailscale.com/stable/${f}" | tar -xz -C /tmp \
+ && cp /tmp/tailscale_*/tailscale /tmp/tailscale_*/tailscaled /usr/local/bin/ \
+ && rm -rf /tmp/tailscale_*
+
+RUN (curl -fsSL https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64 -o /usr/local/bin/runpodctl \
+     && chmod +x /usr/local/bin/runpodctl) || echo "runpodctl not installed"
+
+COPY boot.sh /boot.sh
+RUN chmod +x /boot.sh
+ENV ENGINE=vllm
+ENTRYPOINT ["/boot.sh"]

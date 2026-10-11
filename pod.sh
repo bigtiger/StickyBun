@@ -15,13 +15,25 @@
 #   CTX=16384   IDLE_MIN=30   EXTRA_ARGS=""   TS_TAG=tag:gpu   TS_HOSTNAME=behemoth
 #   NETWORK_VOLUME_ID=...  persist weights across runs (pins the pod to that datacenter)
 #   HF_TOKEN=...
+#   CHAT_TEMPLATE_FILE=path  jinja chat template for llama-server (--jinja). Defaults to
+#       templates/behemoth-tools.jinja for Behemoth: the GGUF's embedded template is chat-only
+#       (supports_tools false, rejects the tool role), so tool calling never worked without it.
+#       Set it empty to keep the GGUF's own template.
+#   PROFILE=name   load profiles/<name>.env (e.g. PROFILE=qwen36-27b ./pod.sh up)
+#   ENGINE=vllm    serve MODEL_REPO with vLLM (image :vllm, needs TOOL_PARSER) instead of llama-server
+#   POD_NAME=...   separate state file + tailnet hostname, so pods can coexist (default behemoth)
 set -euo pipefail
 
 [ -f "$HOME/.config/behemoth-pod.env" ] && . "$HOME/.config/behemoth-pod.env"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "${PROFILE:-}" ]; then . "$HERE/profiles/$PROFILE.env"; fi
 
 API=https://rest.runpod.io/v1
-STATE="$HOME/.behemoth-pod.id"
-HERE="$(cd "$(dirname "$0")" && pwd)"
+POD_NAME=${POD_NAME:-behemoth}
+STATE="$HOME/.$POD_NAME-pod.id"
+ENGINE=${ENGINE:-llama}
+TOOL_PARSER=${TOOL_PARSER:-}
+SERVED_AS=$([ "$ENGINE" = vllm ] && echo model || echo behemoth)   # vllm --served-model-name / llama --alias
 
 GPU_TYPE=${GPU_TYPE:-NVIDIA H100 80GB HBM3}
 GPU_COUNT=${GPU_COUNT:-1}
@@ -30,13 +42,21 @@ MODEL_PATH=${MODEL_PATH:-Behemoth-123B-v2.2-IQ4_XS}
 CTX=${CTX:-16384}
 IDLE_MIN=${IDLE_MIN:-30}
 TS_TAG=${TS_TAG:-tag:gpu}
-TS_HOSTNAME=${TS_HOSTNAME:-behemoth}
-IMAGE=${IMAGE:-ghcr.io/bigtiger/stickybun:latest}   # built from this repo's Dockerfile by CI
+TS_HOSTNAME=${TS_HOSTNAME:-$POD_NAME}
+# Built by CI: :latest from Dockerfile, :vllm from Dockerfile.vllm
+IMAGE=${IMAGE:-ghcr.io/bigtiger/stickybun:$([ "$ENGINE" = vllm ] && echo vllm || echo latest)}
 JOIN_TIMEOUT=${JOIN_TIMEOUT:-600}    # pod must join the tailnet within this, else it is terminated
 READY_TIMEOUT=${READY_TIMEOUT:-3600} # model download + load; on timeout the pod is terminated (a resumable download survives on the volume)
 : "${RUNPOD_API_KEY:?set RUNPOD_API_KEY}"
 
-rp() { curl -fsS --http1.1 -H "Authorization: Bearer $RUNPOD_API_KEY" -H 'Content-Type: application/json' "$@"; }
+# Not curl -f: that discards RunPod's error body, which says why a create was refused (e.g. no capacity).
+rp() {
+  local out code
+  out=$(curl -sS --http1.1 -w '\n%{http_code}' -H "Authorization: Bearer $RUNPOD_API_KEY" -H 'Content-Type: application/json' "$@") || return
+  code=${out##*$'\n'}; out=${out%$'\n'*}
+  if [ "$code" -ge 400 ]; then echo "RunPod HTTP $code: $out" >&2; return 22; fi
+  printf '%s\n' "$out"
+}
 
 mint_ts_key() {
   if [ -n "${TS_AUTHKEY:-}" ]; then echo "$TS_AUTHKEY"; return; fi
@@ -57,6 +77,17 @@ on_tailnet() {
     tailscale status --json 2>/dev/null | jq -e --arg re "$(HOST_RE)" '[.Peer[]? | select(.HostName|test($re))] | length > 0' >/dev/null
   fi
 }
+# Offline ephemeral nodes from earlier runs keep the hostname for a while, so the next pod becomes
+# behemoth-1 and MagicDNS "behemoth" points at a dead node. Remove only offline tag nodes with our hostname.
+ts_cleanup() {
+  [ -n "${TS_API_KEY:-}" ] || return 0
+  ts_devices | jq -r --arg re "$(HOST_RE)" --arg tag "$TS_TAG" \
+    '.devices[] | select(.hostname|test($re)) | select(.connectedToControl|not) | select((.tags // []) | index($tag)) | .id' \
+  | while read -r id; do
+      curl -fsS -X DELETE -u "$TS_API_KEY:" "https://api.tailscale.com/api/v2/device/$id" >/dev/null \
+        && echo "removed stale tailnet node $id"
+    done
+}
 # Tailnet IP of the pod (MagicDNS names don't always resolve locally); falls back to the hostname.
 ts_ip() {
   local ip=""
@@ -73,27 +104,44 @@ pod_alive() {
 cmd_up() {
   if [ -f "$STATE" ]; then echo "pod already recorded ($(cat "$STATE")); run './pod.sh down' first" >&2; exit 1; fi
 
+  ts_cleanup
   local model_dir=/models disk=150
   if [ -n "${NETWORK_VOLUME_ID:-}" ]; then model_dir=/workspace/models; disk=30; fi
   disk=${CONTAINER_DISK:-$disk}
 
   local tskey; tskey=$(mint_ts_key)
 
+  # Shipped in an env var and written out by a start-command wrapper, so the image
+  # (built by CI from boot.sh) doesn't need rebuilding to change the template.
+  local extra="${EXTRA_ARGS:-}" tpl_b64=""
+  if [ -z "${CHAT_TEMPLATE_FILE+x}" ] && [ "$ENGINE" = llama ] && [[ "$MODEL_REPO" == *Behemoth* ]]; then
+    CHAT_TEMPLATE_FILE="$HERE/templates/behemoth-tools.jinja"
+  fi
+  if [ -n "${CHAT_TEMPLATE_FILE:-}" ]; then
+    tpl_b64=$(base64 < "$CHAT_TEMPLATE_FILE" | tr -d '\n')
+    extra="--jinja --chat-template-file /tmp/chat.jinja $extra"
+  fi
+
   local body; body=$(jq -n \
     --arg name "$TS_HOSTNAME" --arg image "$IMAGE" --arg gpu "$GPU_TYPE" --argjson count "$GPU_COUNT" \
     --argjson disk "$disk" \
     --arg tskey "$tskey" --arg host "$TS_HOSTNAME" \
     --arg repo "$MODEL_REPO" --arg mpath "$MODEL_PATH" --arg mdir "$model_dir" \
-    --arg ctx "$CTX" --arg idle "$IDLE_MIN" --arg extra "${EXTRA_ARGS:-}" --arg hf "${HF_TOKEN:-}" \
-    --arg nv "${NETWORK_VOLUME_ID:-}" '
+    --arg ctx "$CTX" --arg idle "$IDLE_MIN" --arg extra "$extra" --arg hf "${HF_TOKEN:-}" \
+    --arg tpl "$tpl_b64" --arg nv "${NETWORK_VOLUME_ID:-}" \
+    --arg engine "$ENGINE" --arg parser "$TOOL_PARSER" '
     {
       name: $name, imageName: $image, cloudType: "SECURE", computeType: "GPU",
       gpuTypeIds: ($gpu | split(",")), gpuTypePriority: "availability", gpuCount: $count,
       containerDiskInGb: $disk, volumeInGb: 0, ports: [],
       env: { TS_AUTHKEY: $tskey, TS_HOSTNAME: $host, MODEL_REPO: $repo,
              MODEL_PATH: $mpath, MODEL_DIR: $mdir, CTX: $ctx, IDLE_MIN: $idle,
-             EXTRA_ARGS: $extra, HF_TOKEN: $hf }
-    } + (if $nv != "" then {networkVolumeId: $nv, volumeMountPath: "/workspace"} else {} end)')
+             EXTRA_ARGS: $extra, HF_TOKEN: $hf, CHAT_TEMPLATE_B64: $tpl,
+             ENGINE: $engine, TOOL_PARSER: $parser }
+    } + (if $tpl != "" then {dockerEntrypoint: ["/bin/bash", "-c"],
+            dockerStartCmd: ["printf %s \"$CHAT_TEMPLATE_B64\" | base64 -d > /tmp/chat.jinja && exec /boot.sh"]}
+         else {} end)
+      + (if $nv != "" then {networkVolumeId: $nv, volumeMountPath: "/workspace"} else {} end)')
 
   echo "creating pod ($GPU_COUNT x $GPU_TYPE, Secure Cloud${NETWORK_VOLUME_ID:+, volume $NETWORK_VOLUME_ID})..."
   local resp; resp=$(rp -d "$body" "$API/pods")
@@ -139,7 +187,7 @@ cmd_up() {
     fi
   done
   echo
-  echo "ready: http://$ip:8080/v1  (OpenAI-compatible, model name: behemoth)"
+  echo "ready: http://$ip:8080/v1  (OpenAI-compatible, model name: $SERVED_AS)"
 }
 
 cmd_test() {
@@ -151,7 +199,7 @@ cmd_test() {
   unset NETWORK_VOLUME_ID
   cmd_up
   echo "test OK. try: curl http://$(ts_ip):8080/v1/chat/completions -H 'Content-Type: application/json' \\"
-  echo "  -d '{\"model\":\"behemoth\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}'"
+  echo "  -d '{\"model\":\"$SERVED_AS\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}]}'"
   echo "then: ./pod.sh down"
 }
 

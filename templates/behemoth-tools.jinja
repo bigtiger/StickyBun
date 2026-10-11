@@ -1,0 +1,62 @@
+{#- Mistral Large 2411 (V7) tool format for Behemoth 123B v2.2. The GGUF's own
+    template (and Mistral's tokenizer_config) is chat-only: it raises on the
+    tool role and ignores `tools`, so llama-server reports supports_tools:
+    false. Based on llama.cpp's mistralai-Mistral-Nemo-Instruct-2407.jinja,
+    with three deliberate differences:
+      - the system prompt stays a leading [SYSTEM_PROMPT] block (Nemo splices
+        it into the last user turn, which would re-prefill the whole prompt
+        every turn);
+      - no user/assistant alternation check: tts-chat sends consecutive user
+        messages (per-turn reminders, auto-continue);
+      - no 9-character tool-call-id check, and string results are JSON-quoted. -#}
+{{- bos_token }}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
+{%- set user_messages = messages | selectattr("role", "equalto", "user") | list %}
+{%- for message in messages %}
+    {%- if message["role"] == "system" %}
+        {{- "[SYSTEM_PROMPT]" + message["content"] + "[/SYSTEM_PROMPT]" }}
+    {%- elif message["role"] == "user" %}
+        {%- if tools is not none and (message == user_messages[-1]) %}
+            {{- "[AVAILABLE_TOOLS][" }}
+            {%- for tool in tools %}
+                {%- set tool = tool.function %}
+                {{- '{"type": "function", "function": {' }}
+                {%- for key, val in tool.items() if key != "return" %}
+                    {{- '"' + key + '": ' }}{{- val|tojson }}
+                    {%- if not loop.last %}
+                        {{- ", " }}
+                    {%- endif %}
+                {%- endfor %}
+                {{- "}}" }}
+                {%- if not loop.last %}
+                    {{- ", " }}
+                {%- else %}
+                    {{- "]" }}
+                {%- endif %}
+            {%- endfor %}
+            {{- "[/AVAILABLE_TOOLS]" }}
+        {%- endif %}
+        {{- "[INST]" + message["content"] + "[/INST]" }}
+    {%- elif message.tool_calls is defined and message.tool_calls is not none %}
+        {{- "[TOOL_CALLS][" }}
+        {%- for tool_call in message.tool_calls %}
+            {#- Pieces emitted separately, never str + tojson: real jinja2 returns
+                Markup from tojson and HTML-escapes the other operand. -#}
+            {%- set out = tool_call.function|tojson|string %}
+            {{- out[:-1] }}{{- ', "id": "' }}{{- tool_call.id|string }}{{- '"}' }}
+            {%- if not loop.last %}
+                {{- ", " }}
+            {%- else %}
+                {{- "]" + eos_token }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif message["role"] == "assistant" %}
+        {{- message["content"] + eos_token }}
+    {%- elif message["role"] == "tool_results" or message["role"] == "tool" %}
+        {{- '[TOOL_RESULTS]{"content": ' }}{{- message.content|string|tojson }}{{- ', "call_id": "' }}{{- message.tool_call_id|string }}{{- '"}[/TOOL_RESULTS]' }}
+    {%- else %}
+        {{- raise_exception("Unsupported role: " + message["role"]) }}
+    {%- endif %}
+{%- endfor %}
