@@ -137,7 +137,11 @@ cmd_up() {
       env: { TS_AUTHKEY: $tskey, TS_HOSTNAME: $host, MODEL_REPO: $repo,
              MODEL_PATH: $mpath, MODEL_DIR: $mdir, CTX: $ctx, IDLE_MIN: $idle,
              EXTRA_ARGS: $extra, HF_TOKEN: $hf, CHAT_TEMPLATE_B64: $tpl,
-             ENGINE: $engine, TOOL_PARSER: $parser }
+             ENGINE: $engine, TOOL_PARSER: $parser,
+             # Hugging Face Xet downloads fail writing to RunPod network volumes
+             # ("File reconstruction error: Internal Writer Error: Background writer
+             # channel closed" -- every Gemma vLLM boot, Oct 2026). Plain HTTP works.
+             HF_HUB_DISABLE_XET: "1" }
     } + (if $tpl != "" then {dockerEntrypoint: ["/bin/bash", "-c"],
             dockerStartCmd: ["printf %s \"$CHAT_TEMPLATE_B64\" | base64 -d > /tmp/chat.jinja && exec /boot.sh"]}
          else {} end)
